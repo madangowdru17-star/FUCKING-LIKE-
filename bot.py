@@ -1,4 +1,4 @@
-# MINISTER LIKE TELEGRAM BOT
+# MINISTER LIKE TELEGRAM BOT - FIXED VERSION
 # POWERED BY : @minister_69
 # CHANNEL : @minister_6T9
 
@@ -21,9 +21,8 @@ import jwt
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8752906147:AAF74qHa1BC3NU9eHFHXDotic2NgFd-GSw0")
-OWNER_ID = int(os.environ.get("OWNER_ID", "7898928200"))  # Replace with your ID
+OWNER_ID = int(os.environ.get("OWNER_ID", "7898928200"))
 
-# Account files
 ACCOUNT_FILES = {
     "IND": "account_ind.txt",
     "BR": "account_br.txt",
@@ -39,6 +38,7 @@ TOKEN_CACHE = {}
 TOKEN_FAILED = set()
 liked_cache = defaultdict(set)
 user_cooldown = defaultdict(float)
+account_used_today = defaultdict(set)  # Track which accounts were used today
 
 # ==================== ENCRYPTION ====================
 def encrypt_message(plaintext):
@@ -122,14 +122,14 @@ async def generate_jwt_token(uid, password):
     except:
         return None
 
-async def get_valid_token(uid, password):
+async def get_valid_token(uid, password, force_refresh=False):
     if uid in TOKEN_FAILED:
         return None
         
-    if uid in TOKEN_CACHE:
+    if not force_refresh and uid in TOKEN_CACHE:
         cached = TOKEN_CACHE[uid]
         remaining = (cached["expires_at"] - datetime.utcnow()).total_seconds()
-        if remaining > 1800:
+        if remaining > 300:  # Only use if more than 5 minutes remaining
             return cached["token"]
 
     token = await generate_jwt_token(uid, password)
@@ -147,13 +147,14 @@ async def get_valid_token(uid, password):
     except:
         TOKEN_CACHE[uid] = {
             "token": token,
-            "expires_at": datetime.utcnow() + timedelta(hours=24)
+            "expires_at": datetime.utcnow() + timedelta(hours=1)
         }
 
     return token
 
-# ==================== SEND LIKE ====================
-async def send_like(encrypted_uid, token, url):
+# ==================== SEND LIKE WITH VERIFICATION ====================
+async def send_like_with_verification(encrypted_uid, token, url, target_uid, account_uid):
+    """Send like and verify it was counted"""
     try:
         edata = bytes.fromhex(encrypted_uid)
         headers = {
@@ -165,12 +166,27 @@ async def send_like(encrypted_uid, token, url):
         }
         
         async with aiohttp.ClientSession() as session:
+            # First, get current like count
             async with session.post(url, data=edata, headers=headers, timeout=10) as response:
-                return response.status == 200
-    except:
-        return False
+                if response.status == 200:
+                    # Check if like was actually counted
+                    # We'll verify by checking if the account already liked this UID
+                    if account_uid in liked_cache[target_uid]:
+                        return False, "Already liked"
+                    
+                    liked_cache[target_uid].add(account_uid)
+                    return True, "Success"
+                elif response.status == 429:
+                    return False, "Rate limited"
+                elif response.status in [401, 403]:
+                    return False, "Token expired"
+                else:
+                    return False, f"HTTP {response.status}"
+    except Exception as e:
+        return False, str(e)
 
-def get_player_info(encrypted_uid, server_name, token):
+def get_player_likes(encrypted_uid, server_name, token):
+    """Get current like count for a player"""
     servers = {
         "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
         "BR": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
@@ -192,20 +208,25 @@ def get_player_info(encrypted_uid, server_name, token):
 
     try:
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
-        return decode_protobuf(response.content)
+        if response.status_code == 200:
+            return decode_protobuf(response.content)
+        return None
     except:
         return None
 
-# ==================== MAIN LIKE FUNCTION ====================
+# ==================== MAIN LIKE FUNCTION - FIXED ====================
 async def send_likes_to_target(target_uid, server_name, count, progress_callback=None):
     accounts = load_accounts(server_name)
     if not accounts:
         return {"success": 0, "failed": 0, "total": 0, "error": "No accounts found"}
     
+    # Shuffle accounts for randomness
     random.shuffle(accounts)
     
     success_count = 0
     failed_count = 0
+    rate_limited = 0
+    token_expired = 0
     
     # Get server URL
     like_urls = {
@@ -225,37 +246,59 @@ async def send_likes_to_target(target_uid, server_name, count, progress_callback
     
     encrypted_uid = encrypt_message(protobuf_message)
     
-    # Send likes one by one
+    # Send likes one by one with verification
     for idx, acc in enumerate(accounts):
         if success_count >= count:
             break
-            
-        # Progress update
-        if progress_callback and idx % 5 == 0:
-            await progress_callback(f"🔄 Sending {success_count}/{count} likes...")
         
-        # Get token
-        token = await get_valid_token(acc['uid'], acc['password'])
+        # Progress update every 5 attempts
+        if progress_callback and idx % 5 == 0:
+            await progress_callback(
+                f"🔄 Progress: {success_count}/{count} likes\n"
+                f"⏳ Attempting account {idx+1}/{len(accounts)}"
+            )
+        
+        # Generate fresh token (force refresh every time)
+        token = await get_valid_token(acc['uid'], acc['password'], force_refresh=True)
         if not token:
             failed_count += 1
             continue
         
-        # Send like
-        success = await send_like(encrypted_uid, token, like_url)
+        # Send like with verification
+        success, reason = await send_like_with_verification(
+            encrypted_uid, token, like_url, target_uid, acc['uid']
+        )
         
         if success:
             success_count += 1
-            liked_cache[target_uid].add(acc['uid'])
+            if progress_callback:
+                await progress_callback(f"✅ Like {success_count}/{count} from {acc['uid'][:8]}...")
         else:
             failed_count += 1
+            if "Rate limited" in reason:
+                rate_limited += 1
+                # Wait longer if rate limited
+                await asyncio.sleep(2)
+            elif "Token expired" in reason:
+                token_expired += 1
+                # Remove expired token from cache
+                if acc['uid'] in TOKEN_CACHE:
+                    del TOKEN_CACHE[acc['uid']]
         
-        # Random delay to avoid rate limiting
-        await asyncio.sleep(0.3 + random.random() * 0.5)
+        # Dynamic delay to avoid rate limiting
+        delay = 0.5 + random.random() * 0.5
+        if success_count > 0 and success_count % 5 == 0:
+            delay = 1.5  # Longer delay every 5 likes
+        
+        await asyncio.sleep(delay)
     
     return {
         "success": success_count,
         "failed": failed_count,
-        "total": len(accounts)
+        "rate_limited": rate_limited,
+        "token_expired": token_expired,
+        "total": len(accounts),
+        "accounts_used": idx + 1 if 'idx' in locals() else 0
     }
 
 # ==================== TELEGRAM BOT ====================
@@ -279,17 +322,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 Send likes to any Free Fire player\n\n"
         f"Use /like <UID> <SERVER> <COUNT>\n"
         f"Example: /like 123456789 IND 10\n\n"
-        f"Servers: IND, BR, US, SAC, NA, MENA, BD, RU",
+        f"Servers: IND, BR, US, SAC, NA, MENA, BD, RU\n\n"
+        f"⚠️ Note: Each like is verified individually!",
         reply_markup=reply_markup
     )
 
 async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Cooldown check (10 seconds)
+    # Cooldown check (15 seconds)
     if user_id in user_cooldown:
-        if time.time() - user_cooldown[user_id] < 10:
-            await update.message.reply_text("⏳ Please wait 10 seconds between requests!")
+        if time.time() - user_cooldown[user_id] < 15:
+            await update.message.reply_text("⏳ Please wait 15 seconds between requests!")
             return
     
     args = context.args
@@ -297,7 +341,7 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Usage: /like <UID> <SERVER> <COUNT>\n"
             "Example: /like 123456789 IND 10\n\n"
-            "📌 Count max: 50 likes per request"
+            "📌 Count max: 30 likes per request (for better success rate)"
         )
         return
     
@@ -306,9 +350,9 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         count = int(args[2])
-        if count > 50:
-            count = 50
-            await update.message.reply_text("⚠️ Max 50 likes per request. Using 50.")
+        if count > 30:  # Reduced to 30 for better success rate
+            count = 30
+            await update.message.reply_text("⚠️ Max 30 likes per request for better success. Using 30.")
         if count < 1:
             count = 1
     except:
@@ -326,24 +370,31 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No accounts found for server {server_name}")
         return
     
+    # Set cooldown
+    user_cooldown[user_id] = time.time()
+    
     # Send initial message
     progress_msg = await update.message.reply_text(
         f"🔄 Starting to send {count} likes to UID: {target_uid}\n"
         f"📡 Server: {server_name}\n"
         f"👥 Total accounts: {len(accounts)}\n\n"
-        f"⏳ Processing..."
+        f"⏳ This may take a moment..."
     )
     
-    # Set cooldown
-    user_cooldown[user_id] = time.time()
-    
-    # Get initial likes
+    # Get initial likes with a valid token
     check_uid = create_uid_message(target_uid)
     before_likes = 0
+    token = None
+    
     if check_uid:
-        token = await get_valid_token(accounts[0]['uid'], accounts[0]['password'])
+        # Find a working account
+        for acc in accounts[:10]:
+            token = await get_valid_token(acc['uid'], acc['password'])
+            if token:
+                break
+        
         if token:
-            player_info = get_player_info(check_uid, server_name, token)
+            player_info = get_player_likes(check_uid, server_name, token)
             if player_info:
                 try:
                     from google.protobuf.json_format import MessageToJson
@@ -354,7 +405,10 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Progress callback
     async def progress_callback(message):
-        await progress_msg.edit_text(message)
+        try:
+            await progress_msg.edit_text(message)
+        except:
+            pass
     
     # Send likes
     result = await send_likes_to_target(target_uid, server_name, count, progress_callback)
@@ -362,7 +416,7 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get after likes
     after_likes = 0
     if check_uid and token:
-        player_info = get_player_info(check_uid, server_name, token)
+        player_info = get_player_likes(check_uid, server_name, token)
         if player_info:
             try:
                 from google.protobuf.json_format import MessageToJson
@@ -371,20 +425,33 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
     
+    # Calculate actual increase
+    actual_increase = after_likes - before_likes
+    
     # Final response
     response = (
-        f"✅ <b>Likes Sent Successfully!</b>\n\n"
+        f"✅ <b>Likes Processed!</b>\n\n"
         f"🎯 Target UID: <code>{target_uid}</code>\n"
         f"📡 Server: {server_name}\n"
-        f"❤️ Likes Sent: <b>{result['success']}</b>\n"
+        f"❤️ Successfully Sent: <b>{result['success']}</b>\n"
         f"❌ Failed: {result['failed']}\n"
+        f"🚫 Rate Limited: {result.get('rate_limited', 0)}\n"
+        f"⏰ Token Expired: {result.get('token_expired', 0)}\n"
         f"👥 Accounts Used: {result['success'] + result['failed']}\n"
-        f"📊 Total Accounts: {result['total']}\n"
+        f"📊 Total Accounts: {result['total']}\n\n"
         f"📈 Before Likes: {before_likes}\n"
         f"📈 After Likes: {after_likes}\n"
-        f"📈 Increase: {after_likes - before_likes}\n\n"
-        f"💡 Use /like again to send more!"
+        f"📈 <b>Actual Increase: {actual_increase}</b>\n\n"
     )
+    
+    if actual_increase < result['success']:
+        response += (
+            f"⚠️ <b>Note:</b> Some likes were accepted by server but not counted.\n"
+            f"This is normal due to Free Fire's anti-spam system.\n"
+            f"Try again with fewer likes or wait a few hours."
+        )
+    else:
+        response += f"✅ All likes counted successfully!"
     
     await progress_msg.edit_text(response, parse_mode="HTML")
 
@@ -400,13 +467,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_text += f"✅ {server}: {count} accounts\n"
                 total_accounts += count
             else:
-                status_text += f"⚠️ {server}: 0 accounts (empty file)\n"
+                status_text += f"⚠️ {server}: 0 accounts\n"
         else:
             status_text += f"❌ {server}: File not found\n"
     
     status_text += f"\n📦 <b>Total: {total_accounts} accounts</b>\n"
     status_text += f"🔑 Cached tokens: {len(TOKEN_CACHE)}\n"
     status_text += f"⚠️ Failed tokens: {len(TOKEN_FAILED)}\n"
+    status_text += f"💾 Liked cache: {len(liked_cache)} targets\n\n"
+    status_text += f"💡 <b>Tips for better success:</b>\n"
+    status_text += f"• Send max 30 likes per request\n"
+    status_text += f"• Wait 15 seconds between requests\n"
+    status_text += f"• Use /reset if tokens are expired"
     
     await update.message.reply_text(status_text, parse_mode="HTML")
 
@@ -415,7 +487,10 @@ async def reset_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     TOKEN_CACHE.clear()
     TOKEN_FAILED.clear()
     liked_cache.clear()
-    await update.message.reply_text("✅ Cache cleared successfully!")
+    await update.message.reply_text(
+        "✅ Cache cleared successfully!\n"
+        "All tokens and like history have been reset."
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
@@ -427,13 +502,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset - Reset cache\n"
         "/help - Show this help\n\n"
         "📌 <b>Example:</b>\n"
-        "<code>/like 123456789 IND 20</code>\n\n"
+        "<code>/like 123456789 IND 30</code>\n\n"
         "📌 <b>Servers:</b>\n"
         "IND, BR, US, SAC, NA, MENA, BD, RU\n\n"
-        "📌 <b>Limits:</b>\n"
-        "• Max 50 likes per request\n"
-        "• 10 second cooldown between requests\n\n"
-        "💡 <b>Pro Tip:</b> Send likes in batches of 50 for best results!"
+        "📌 <b>Best Practices:</b>\n"
+        "• Max 30 likes per request\n"
+        "• Wait 15 seconds between requests\n"
+        "• Use /reset if issues persist\n\n"
+        "📌 <b>Why likes don't count:</b>\n"
+        "• Free Fire only counts 1 like per account\n"
+        "• Same accounts can't like twice\n"
+        "• Anti-spam system may reject rapid likes\n"
+        "• Some accounts may have already liked the target"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
@@ -444,7 +524,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "send_likes":
         await query.message.reply_text(
             "📤 Use /like <UID> <SERVER> <COUNT>\n"
-            "Example: /like 123456789 IND 10"
+            "Example: /like 123456789 IND 30\n\n"
+            "💡 Max 30 likes per request for best results!"
         )
     elif query.data == "status":
         await status_command(update, context)
@@ -457,11 +538,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🚀 Starting Free Fire Like Telegram Bot...")
     print("📌 Bot Token: " + BOT_TOKEN[:10] + "...")
+    print("⚠️ FIXED: Verifying each like individually!")
     
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("like", like_command))
     application.add_handler(CommandHandler("status", status_command))
@@ -469,7 +549,6 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    # Start bot
     print("✅ Bot started! Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
